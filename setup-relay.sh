@@ -1,181 +1,201 @@
 #!/usr/bin/env bash
-#
-# setup-relay.sh — РУ-вход: форвардинг UDP-порта AmneziaWG на backend (NUXTCLOUD).
-#
-# Запускается НА РОССИЙСКОМ сервере (чистый AS).
-# Тупой ретранслятор: принимает UDP на :PORT и шлёт на DEST:PORT.
-# Крипту не трогает, шифрование остаётся end-to-end клиент<->backend.
-#
-# Идемпотентно: можно запускать сколько угодно раз, состояние одинаковое.
-# Правила помечаются comment'ом RELAY_TAG, при перезапуске сносятся только свои.
-#
-# Использование:
-#   sudo ./setup-relay.sh --dest 5.104.75.166 --port 35662
-#   sudo ./setup-relay.sh --dest 5.104.75.166 --port 35662 --tcp 4443   # +Reality-фолбэк
-#   sudo ./setup-relay.sh --status     # показать текущие правила
-#   sudo ./setup-relay.sh --remove     # снять всё, что поставил скрипт
-#
 set -euo pipefail
 
-RELAY_TAG="relay-managed"          # маркер наших правил в iptables
-ENV_FILE="/etc/relay/relay.env"    # сюда сохраняем вводные для systemd/перезапуска
+TAG="relay-managed"
+ENV_DIR="/etc/relay"
 SYSCTL_FILE="/etc/sysctl.d/99-relay.conf"
 UNIT_FILE="/etc/systemd/system/relay.service"
 SELF_PATH="$(readlink -f "$0")"
 
-DEST_IP=""
-UDP_PORT=""
-TCP_PORT=""        # опционально: проброс TCP (для Reality-запаски через тот же вход)
-ACTION="apply"
+ACTION=""
+NAME=""
+DEST=""
+DPORT=""
+LPORT=""
+PROTO="udp"
 
-# ---------- разбор аргументов ----------
+usage(){
+  cat <<USAGE
+relay — форвардинг порта на backend. Несколько маршрутов работают параллельно.
+
+  add     --name N --dest IP --dport PORT [--lport PORT] [--proto udp|tcp]
+  remove  --name N
+  list
+  reapply
+  purge
+
+  --name   уникальное имя маршрута (метка правил и ключ для удаления)
+  --dest   IP backend
+  --dport  порт на backend
+  --lport  входной порт на этом сервере (по умолчанию = --dport)
+  --proto  udp (по умолчанию) или tcp
+USAGE
+}
+
+die(){ echo "ОШИБКА: $*" >&2; exit 1; }
+need_root(){ [[ $EUID -eq 0 ]] || die "нужен root (sudo)"; }
+have_ufw(){ command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; }
+
+[[ $# -gt 0 ]] || { usage; exit 1; }
+ACTION="$1"; shift || true
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dest)   DEST_IP="$2"; shift 2 ;;
-    --port)   UDP_PORT="$2"; shift 2 ;;
-    --tcp)    TCP_PORT="$2"; shift 2 ;;
-    --status) ACTION="status"; shift ;;
-    --remove) ACTION="remove"; shift ;;
-    -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "Неизвестный аргумент: $1" >&2; exit 1 ;;
+    --name)  NAME="$2"; shift 2 ;;
+    --dest)  DEST="$2"; shift 2 ;;
+    --dport) DPORT="$2"; shift 2 ;;
+    --lport) LPORT="$2"; shift 2 ;;
+    --proto) PROTO="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "неизвестный аргумент: $1" ;;
   esac
 done
 
-# ---------- утилиты ----------
-die(){ echo "ОШИБКА: $*" >&2; exit 1; }
-need_root(){ [[ $EUID -eq 0 ]] || die "нужен root (sudo)"; }
-
-# Удалить ВСЕ наши правила (по RELAY_TAG) из таблицы nat, не трогая чужие.
-# iptables-save -t nat -> выкидываем строки с нашим тегом -> грузим обратно.
-clear_our_rules(){
-  iptables-save -t nat \
-    | grep -v -- "--comment ${RELAY_TAG}" \
-    | grep -v -- "--comment \"${RELAY_TAG}\"" \
-    | iptables-restore -T nat
-}
-
-load_env(){ [[ -f "$ENV_FILE" ]] && . "$ENV_FILE" || true; }
-
-# ---------- действия ----------
-do_status(){
-  echo "== Наши NAT-правила (${RELAY_TAG}) =="
-  iptables -t nat -S | grep -- "${RELAY_TAG}" || echo "(нет)"
-  echo
-  echo "== net.ipv4.ip_forward =="
-  sysctl -n net.ipv4.ip_forward
-  echo
-  echo "== relay.service =="
-  systemctl is-enabled relay.service 2>/dev/null || echo "(не установлен)"
-  [[ -f "$ENV_FILE" ]] && { echo "== $ENV_FILE =="; cat "$ENV_FILE"; }
-}
-
-do_remove(){
-  need_root
-  echo "[*] Снимаю правила relay..."
-  clear_our_rules
-  rm -f "$SYSCTL_FILE"
-  systemctl disable --now relay.service 2>/dev/null || true
-  rm -f "$UNIT_FILE"
-  systemctl daemon-reload 2>/dev/null || true
-  echo "[+] Удалено. (ENV $ENV_FILE оставлен — удали вручную при желании.)"
-}
-
-do_apply(){
-  need_root
-
-  # Если вводные не переданы в этот запуск — взять из сохранённого env
-  # (так systemd при ребуте поднимает то же самое).
-  if [[ -z "$DEST_IP" || -z "$UDP_PORT" ]]; then
-    load_env
-    DEST_IP="${DEST_IP:-${RELAY_DEST:-}}"
-    UDP_PORT="${UDP_PORT:-${RELAY_UDP_PORT:-}}"
-    TCP_PORT="${TCP_PORT:-${RELAY_TCP_PORT:-}}"
-  fi
-  [[ -n "$DEST_IP"  ]] || die "не задан --dest (IP backend)"
-  [[ -n "$UDP_PORT" ]] || die "не задан --port (UDP-порт AmneziaWG)"
-  [[ "$DEST_IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || die "--dest должен быть IPv4"
-
-  command -v iptables >/dev/null || { apt-get update -qq && apt-get install -y iptables; }
-
-  echo "[*] Backend  : $DEST_IP"
-  echo "[*] UDP-порт : $UDP_PORT"
-  [[ -n "$TCP_PORT" ]] && echo "[*] TCP-порт : $TCP_PORT (Reality-фолбэк)"
-
-  # 1) включить маршрутизацию пакетов между интерфейсами
+enable_forwarding(){
   echo 'net.ipv4.ip_forward=1' > "$SYSCTL_FILE"
   sysctl -q -p "$SYSCTL_FILE"
+}
 
-  # 2) идемпотентность: снести прошлые наши правила
-  clear_our_rules
+# Снять правила одного маршрута по его метке "TAG:NAME".
+clear_route(){
+  local label="$1"
+  { iptables-save -t nat \
+      | { grep -v -- "--comment ${label}\b" || true; } \
+      | { grep -v -- "--comment \"${label}\"" || true; }
+  } | iptables-restore -T nat
+}
 
-  # 3) поставить заново, с маркером RELAY_TAG
-  # UDP — основной трафик AmneziaWG
-  iptables -t nat -A PREROUTING  -p udp --dport "$UDP_PORT" \
-    -j DNAT --to-destination "${DEST_IP}:${UDP_PORT}" \
-    -m comment --comment "$RELAY_TAG"
-  iptables -t nat -A POSTROUTING -p udp -d "$DEST_IP" --dport "$UDP_PORT" \
-    -j MASQUERADE \
-    -m comment --comment "$RELAY_TAG"
-
-  # TCP — опционально (Reality на том же входе)
-  if [[ -n "$TCP_PORT" ]]; then
-    iptables -t nat -A PREROUTING  -p tcp --dport "$TCP_PORT" \
-      -j DNAT --to-destination "${DEST_IP}:${TCP_PORT}" \
-      -m comment --comment "$RELAY_TAG"
-    iptables -t nat -A POSTROUTING -p tcp -d "$DEST_IP" --dport "$TCP_PORT" \
-      -j MASQUERADE \
-      -m comment --comment "$RELAY_TAG"
-  fi
-
-  # 4) открыть порт в ufw, если он активен (иначе пропускаем молча)
-  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${UDP_PORT}/udp" >/dev/null || true
-    [[ -n "$TCP_PORT" ]] && ufw allow "${TCP_PORT}/tcp" >/dev/null || true
-    echo "[*] ufw: порты открыты"
-  fi
-
-  # 5) сохранить вводные для перезапуска/ребута
-  mkdir -p "$(dirname "$ENV_FILE")"
-  {
-    echo "RELAY_DEST=$DEST_IP"
-    echo "RELAY_UDP_PORT=$UDP_PORT"
-    echo "RELAY_TCP_PORT=$TCP_PORT"
-  } > "$ENV_FILE"
-
-  # 6) systemd-unit: при загрузке заново прогоняет этот же скрипт.
-  #    Переживает reboot И смену вводных (поправил env -> systemctl restart relay).
-  cat > "$UNIT_FILE" <<EOF
+install_unit(){
+  cat > "$UNIT_FILE" <<UNIT
 [Unit]
-Description=AmneziaWG UDP relay (DNAT to backend)
+Description=relay routes (DNAT to backends)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-EnvironmentFile=$ENV_FILE
-ExecStart=$SELF_PATH
-ExecStop=$SELF_PATH --remove
+ExecStart=$SELF_PATH reapply
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
   systemctl daemon-reload
   systemctl enable relay.service >/dev/null 2>&1 || true
+}
 
+apply_route(){
+  local name="$1" dest="$2" dport="$3" lport="$4" proto="$5"
+  local label="${TAG}:${name}"
+  iptables -t nat -A PREROUTING  -p "$proto" --dport "$lport" \
+    -j DNAT --to-destination "${dest}:${dport}" \
+    -m comment --comment "$label"
+  iptables -t nat -A POSTROUTING -p "$proto" -d "$dest" --dport "$dport" \
+    -j MASQUERADE \
+    -m comment --comment "$label"
+  if have_ufw; then ufw allow "${lport}/${proto}" >/dev/null || true; fi
+}
+
+save_route(){
+  mkdir -p "$ENV_DIR"
+  cat > "${ENV_DIR}/${1}.route" <<ROUTE
+NAME=$1
+DEST=$2
+DPORT=$3
+LPORT=$4
+PROTO=$5
+ROUTE
+}
+
+do_add(){
+  need_root
+  [[ -n "$NAME"  ]] || die "не задан --name"
+  [[ -n "$DEST"  ]] || die "не задан --dest"
+  [[ -n "$DPORT" ]] || die "не задан --dport"
+  [[ "$DEST" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || die "--dest должен быть IPv4"
+  [[ "$PROTO" == "udp" || "$PROTO" == "tcp" ]] || die "--proto: udp или tcp"
+  LPORT="${LPORT:-$DPORT}"
+  command -v iptables >/dev/null || { apt-get update -qq; apt-get install -y iptables; }
+
+  for f in "${ENV_DIR}"/*.route; do
+    [[ -e "$f" ]] || continue
+    local en ep epr
+    en="$(.  "$f"; echo "$NAME")"
+    ep="$(.  "$f"; echo "$LPORT")"
+    epr="$(. "$f"; echo "$PROTO")"
+    if [[ "$en" != "$NAME" && "$ep" == "$LPORT" && "$epr" == "$PROTO" ]]; then
+      die "входной порт ${LPORT}/${PROTO} уже занят маршрутом '$en' — задай другой --lport"
+    fi
+  done
+
+  enable_forwarding
+  clear_route "${TAG}:${NAME}"
+  apply_route "$NAME" "$DEST" "$DPORT" "$LPORT" "$PROTO"
+  save_route "$NAME" "$DEST" "$DPORT" "$LPORT" "$PROTO"
+  install_unit
+
+  echo "[+] маршрут '$NAME' добавлен:  :${LPORT}/${PROTO}  ->  ${DEST}:${DPORT}"
+  do_list
   echo
-  echo "[+] Готово. Текущие правила:"
-  iptables -t nat -S | grep -- "${RELAY_TAG}" | sed 's/^/    /'
-  echo
-  echo "[i] Проверка с клиента ПОД НАГРУЗКОЙ (качай что-то через VPN параллельно):"
-  echo "      mtr 10.8.1.1            # внутренний адрес туннеля"
-  echo "      mtr $DEST_IP           # путь до backend"
-  echo "[i] Если первый хоп клиент->этот сервер чистый и потери не растут — успех."
+  echo "[i] проверка с клиента под нагрузкой:"
+  echo "      mtr <этот_сервер>     # первый хоп, потери ~0"
+  echo "      mtr ${DEST}           # путь до backend"
+}
+
+do_remove(){
+  need_root
+  [[ -n "$NAME" ]] || die "не задан --name"
+  clear_route "${TAG}:${NAME}"
+  if [[ -f "${ENV_DIR}/${NAME}.route" ]]; then
+    local lp pr; lp="$(. "${ENV_DIR}/${NAME}.route"; echo "$LPORT")"; pr="$(. "${ENV_DIR}/${NAME}.route"; echo "$PROTO")"
+    have_ufw && ufw delete allow "${lp}/${pr}" >/dev/null 2>&1 || true
+    rm -f "${ENV_DIR}/${NAME}.route"
+  fi
+  echo "[+] маршрут '$NAME' снят"
+  do_list
+}
+
+do_list(){
+  echo "== активные маршруты =="
+  local found=0
+  for f in "${ENV_DIR}"/*.route; do
+    [[ -e "$f" ]] || continue
+    found=1
+    ( . "$f"; printf "  %-12s :%s/%s -> %s:%s\n" "$NAME" "$LPORT" "$PROTO" "$DEST" "$DPORT" )
+  done
+  [[ $found -eq 1 ]] || echo "  (нет)"
+  echo "== правила в iptables (nat) =="
+  iptables -t nat -S | grep -- "$TAG" | sed 's/^/  /' || echo "  (нет)"
+}
+
+do_reapply(){
+  need_root
+  enable_forwarding
+  for f in "${ENV_DIR}"/*.route; do
+    [[ -e "$f" ]] || continue
+    ( . "$f"
+      { iptables-save -t nat | { grep -v -- "--comment ${TAG}:${NAME}\b" || true; }; } | iptables-restore -T nat
+      iptables -t nat -A PREROUTING  -p "$PROTO" --dport "$LPORT" -j DNAT --to-destination "${DEST}:${DPORT}" -m comment --comment "${TAG}:${NAME}"
+      iptables -t nat -A POSTROUTING -p "$PROTO" -d "$DEST" --dport "$DPORT" -j MASQUERADE -m comment --comment "${TAG}:${NAME}"
+    )
+  done
+  do_list
+}
+
+do_purge(){
+  need_root
+  { iptables-save -t nat | { grep -v -- "--comment ${TAG}" || true; } | { grep -v -- "--comment \"${TAG}" || true; }; } | iptables-restore -T nat
+  systemctl disable --now relay.service 2>/dev/null || true
+  rm -f "$UNIT_FILE" "$SYSCTL_FILE"
+  rm -rf "$ENV_DIR"
+  systemctl daemon-reload 2>/dev/null || true
+  echo "[+] все маршруты и юнит удалены"
 }
 
 case "$ACTION" in
-  apply)  do_apply  ;;
-  status) do_status ;;
-  remove) do_remove ;;
+  add)     do_add ;;
+  remove)  do_remove ;;
+  list)    do_list ;;
+  reapply) do_reapply ;;
+  purge)   do_purge ;;
+  *) usage; exit 1 ;;
 esac
